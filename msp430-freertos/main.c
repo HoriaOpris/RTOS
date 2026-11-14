@@ -9,7 +9,8 @@
  *
  * Serial port: 115200 baud, 8N1, on the LaunchPad's "application UART".
  * The console task draws a status screen that refreshes twice a second and
- * accepts the commands on, off and stats (type, then Enter).
+ * accepts the commands on, off, stats and lcd (type, then Enter).
+ * The board's own LCD is driven through lcd.h.
  */
 #include <msp430.h>
 #include <stdint.h>
@@ -19,6 +20,8 @@
 #include "task.h"
 #include "queue.h"
 #include "semphr.h"
+
+#include "lcd.h"
 
 /* --- Board pins --------------------------------------------------------- */
 #define LED_RED_BIT     BIT0    /* P1.0 */
@@ -35,7 +38,7 @@
 #define TERM_HOME       "\x1b[H"        /* cursor to top left */
 #define TERM_EOL        "\x1b[K\r\n"    /* clear rest of line, next line */
 #define TERM_CLEAR_DOWN "\x1b[J"        /* clear from cursor to end of screen */
-#define TERM_PROMPT_ROW "\x1b[14;1H"    /* cursor to the input line */
+#define TERM_PROMPT_ROW "\x1b[15;1H"    /* cursor to the input line */
 
 /* The FreeRTOS heap. PERSISTENT places it in FRAM rather than the 2 KB RAM. */
 #pragma PERSISTENT( ucHeap )
@@ -191,6 +194,12 @@ static void handle_line( const char *line )
         result_append( " words, rx lost " );
         result_append_uint( usRxDropped );
     }
+    else if( strncmp( line, "lcd ", 4 ) == 0 )
+    {
+        lcd_print( &line[ 4 ] );
+        result_set( "LCD shows: " );
+        result_append( &line[ 4 ] );
+    }
     else
     {
         result_set( "echo: " );
@@ -242,6 +251,7 @@ static void draw_screen( void )
                "  on     turn the green LED on" TERM_EOL
                "  off    turn the green LED off" TERM_EOL
                "  stats  show heap and stack usage" TERM_EOL
+               "  lcd X  show X on the board's LCD (6 characters)" TERM_EOL
                "  (anything else is echoed back)" TERM_EOL
                TERM_EOL );
 
@@ -258,6 +268,8 @@ static void console_task( void *pvParameters )
     uint8_t c;
 
     ( void ) pvParameters;
+
+    lcd_print( "RTOS" );
 
     for( ;; )
     {
@@ -378,6 +390,7 @@ int _system_pre_init( void )
 int main( void )
 {
     hardware_init();
+    lcd_init();
 
     xRxQueue = xQueueCreate( RX_QUEUE_LENGTH, sizeof( uint8_t ) );
     xUartMutex = xSemaphoreCreateMutex();

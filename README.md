@@ -5,6 +5,7 @@
 FreeRTOS V11.3.3 on the MSP-EXP430FR6989 LaunchPad, as a Code Composer Studio project.
 
 - `main.c`: hardware setup, UART receive interrupt, blink and console tasks, a queue and a mutex.
+- `lcd.h`, `lcd.c`: driver for the board's 6-character LCD (`lcd_print`, `lcd_put_char`, `lcd_print_uint`, `lcd_clear`).
 - `FreeRTOSConfig.h`: kernel settings (tick rate, heap size, priorities).
 - `FreeRTOS/`: unmodified kernel sources and the CCS MSP430X port.
 
@@ -36,5 +37,5 @@ screen /dev/cu.usbmodem3103 115200
 
 The board draws a status screen that refreshes twice a second: red LED flash count, up time,
 green LED state, the last command's result and the command list.
-Commands, each ended with Enter: `on`, `off` (green LED), `stats`. Anything else is echoed.
+Commands, each ended with Enter: `on`, `off` (green LED), `stats`, `lcd TEXT` (show TEXT on the LCD). Anything else is echoed.
 Quit `screen` with Ctrl-A then K.
