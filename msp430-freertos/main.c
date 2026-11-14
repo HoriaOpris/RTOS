@@ -49,7 +49,7 @@ uint8_t ucHeap[ configTOTAL_HEAP_SIZE ] = { 0 };
 
 static QueueHandle_t xRxQueue;          /* bytes: UART interrupt -> console task */
 static SemaphoreHandle_t xUartMutex;    /* guards the UART transmitter */
-static TaskHandle_t xBlinkTask, xConsoleTask, xButtonTask, xLcdTask;
+static TaskHandle_t xBlinkTask, xConsoleTask, xButtonTask;
 
 static volatile uint16_t usRxDropped;   /* bytes lost because the queue was full */
 
@@ -308,19 +308,6 @@ static void console_task( void *pvParameters )
     }
 }
 
-static void update_lcd_task( void *pvParameters )
-{
-    TickType_t xLastWake = xTaskGetTickCount();
-
-    ( void ) pvParameters;
-
-    for(;;)
-    {
-        lcd_print_uint(usButtonPressCount);
-        vTaskDelayUntil( &xLastWake, pdMS_TO_TICKS( 50 ) );
-    }
-}
-
 /* --- Buttons ----------------------------------------------------------- */
 
 /* Port 1 interrupt: runs when S1 or S2 goes from released to pressed.
@@ -394,6 +381,7 @@ static void button_task( void *pvParameters )
             }
         }
 
+        lcd_print_uint(usButtonPressCount);
         /* P1IE is also written by the interrupt, so change it with
          * interrupts off. */
         taskENTER_CRITICAL();
@@ -509,7 +497,6 @@ int main( void )
     /* The console task has the higher priority so input is handled promptly. */
     xTaskCreate( blink_task, "blink", configMINIMAL_STACK_SIZE, NULL, 1, &xBlinkTask );
     xTaskCreate( console_task, "console", 160, NULL, 2, &xConsoleTask );
-    xTaskCreate( update_lcd_task, "lcd", configMINIMAL_STACK_SIZE, NULL, 3, &xLcdTask );
     xTaskCreate( button_task, "button", configMINIMAL_STACK_SIZE, NULL, 4, &xButtonTask );
 
     vTaskStartScheduler();
