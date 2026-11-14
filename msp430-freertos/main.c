@@ -25,6 +25,8 @@
 
 /* --- Board pins --------------------------------------------------------- */
 #define LED_RED_BIT     BIT0    /* P1.0 */
+#define BUTTON_S1_BIT   BIT1    /* P1.1 */
+#define BUTTON_S2_BIT   BIT2    /* P1.2 */
 #define LED_GREEN_BIT   BIT7    /* P9.7 */
 #define UART_TX_BIT     BIT4    /* P3.4, eUSCI_A1 */
 #define UART_RX_BIT     BIT5    /* P3.5, eUSCI_A1 */
@@ -46,7 +48,7 @@ uint8_t ucHeap[ configTOTAL_HEAP_SIZE ] = { 0 };
 
 static QueueHandle_t xRxQueue;          /* bytes: UART interrupt -> console task */
 static SemaphoreHandle_t xUartMutex;    /* guards the UART transmitter */
-static TaskHandle_t xBlinkTask, xConsoleTask;
+static TaskHandle_t xBlinkTask, xConsoleTask, xButtonTask, xButton2Task, xLcdTask;
 
 static volatile uint16_t usRxDropped;   /* bytes lost because the queue was full */
 
@@ -58,6 +60,7 @@ static volatile uint16_t usRxDropped;   /* bytes lost because the queue was full
  * every access is wrapped in a critical section. */
 static volatile uint16_t usFlashCount;
 static volatile uint32_t ulHalfSeconds;
+static volatile uint16_t usButtonPressCount;
 
 /* --- UART output -------------------------------------------------------- */
 
@@ -304,6 +307,66 @@ static void console_task( void *pvParameters )
     }
 }
 
+static void update_lcd_task( void *pvParameters )
+{
+    TickType_t xLastWake = xTaskGetTickCount();
+
+    ( void ) pvParameters;
+
+    for(;;)
+    {
+        lcd_print_uint(usButtonPressCount);
+        vTaskDelayUntil( &xLastWake, pdMS_TO_TICKS( 50 ) );
+    }
+}
+
+static void button_task( void *pvParameters )
+{
+    TickType_t xLastWake = xTaskGetTickCount();
+
+    uint8_t ucPressed, ucWasPressed = 0;
+
+    ( void ) pvParameters;
+
+    for( ;; )
+    {
+        /* The pin reads 0 while the button is held down. Count only the
+         * change from released to pressed; sampling every 50 ms also skips
+         * over contact bounce. */
+        ucPressed = ( uint8_t ) ( ( P1IN & BUTTON_S1_BIT ) == 0 );
+        if( ( ucPressed != 0 ) && ( ucWasPressed == 0 ) )
+        {
+            usButtonPressCount++;
+        }
+        ucWasPressed = ucPressed;
+
+        vTaskDelayUntil( &xLastWake, pdMS_TO_TICKS( 50 ) );
+    }
+}
+
+static void button2_task( void *pvParameters )
+{
+    TickType_t xLastWake = xTaskGetTickCount();
+
+    uint8_t ucPressed, ucWasPressed = 0;
+
+    ( void ) pvParameters;
+
+    for( ;; )
+    {
+        /* The pin reads 0 while the button is held down. Count only the
+         * change from released to pressed; sampling every 50 ms also skips
+         * over contact bounce. */
+        ucPressed = ( uint8_t ) ( ( P1IN & BUTTON_S2_BIT ) == 0 );
+        if( ( ucPressed != 0 ) && ( ucWasPressed == 0 ) )
+        {
+            usButtonPressCount--;
+        }
+        ucWasPressed = ucPressed;
+
+        vTaskDelayUntil( &xLastWake, pdMS_TO_TICKS( 50 ) );
+    }
+}
 /* --- Hardware setup ----------------------------------------------------- */
 
 static void hardware_init( void )
@@ -315,6 +378,15 @@ static void hardware_init( void )
     P1DIR |= LED_RED_BIT;
     P9OUT &= ~LED_GREEN_BIT;
     P9DIR |= LED_GREEN_BIT;
+
+    /* Button S1,SW as an input with the internal pull-up: it reads 1 when
+     * released and 0 when pressed. */
+    P1DIR &= ~BUTTON_S1_BIT;
+    P1REN |= BUTTON_S1_BIT;
+    P1OUT |= BUTTON_S1_BIT;
+    P1DIR &= ~BUTTON_S2_BIT;
+    P1REN |= BUTTON_S2_BIT;
+    P1OUT |= BUTTON_S2_BIT;
 
     /* UART pins to eUSCI_A1. */
     P3SEL0 |= UART_TX_BIT | UART_RX_BIT;
@@ -400,6 +472,9 @@ int main( void )
     /* The console task has the higher priority so input is handled promptly. */
     xTaskCreate( blink_task, "blink", configMINIMAL_STACK_SIZE, NULL, 1, &xBlinkTask );
     xTaskCreate( console_task, "console", 160, NULL, 2, &xConsoleTask );
+    xTaskCreate( update_lcd_task, "lcd", configMINIMAL_STACK_SIZE, NULL, 3, &xLcdTask );
+    xTaskCreate( button_task, "button", configMINIMAL_STACK_SIZE, NULL, 4, &xButtonTask );
+    xTaskCreate( button2_task, "button2", configMINIMAL_STACK_SIZE, NULL, 5, &xButton2Task );
 
     vTaskStartScheduler();
 

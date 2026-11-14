@@ -11,7 +11,7 @@
 /* --- Scheduler ---------------------------------------------------------- */
 #define configUSE_PREEMPTION                1       /* higher priority task always runs */
 #define configUSE_TIME_SLICING              1       /* equal priorities share the CPU each tick */
-#define configMAX_PRIORITIES                4
+#define configMAX_PRIORITIES                10       /* valid task priorities are 0 to 9 */
 #define configCPU_CLOCK_HZ                  8000000UL
 #define configTICK_RATE_HZ                  1000    /* 1 ms tick */
 #define configTICK_TYPE_WIDTH_IN_BITS       TICK_TYPE_WIDTH_16_BITS

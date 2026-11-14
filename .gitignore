@@ -2,3 +2,4 @@ Debug/
 Release/
 .DS_Store
 .clangd
+msp430-freertos/.theia/launch.json
