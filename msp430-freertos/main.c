@@ -27,6 +27,7 @@
 #define LED_RED_BIT     BIT0    /* P1.0 */
 #define BUTTON_S1_BIT   BIT1    /* P1.1 */
 #define BUTTON_S2_BIT   BIT2    /* P1.2 */
+#define BUTTON_BITS     ( BUTTON_S1_BIT | BUTTON_S2_BIT )
 #define LED_GREEN_BIT   BIT7    /* P9.7 */
 #define UART_TX_BIT     BIT4    /* P3.4, eUSCI_A1 */
 #define UART_RX_BIT     BIT5    /* P3.5, eUSCI_A1 */
@@ -48,7 +49,7 @@ uint8_t ucHeap[ configTOTAL_HEAP_SIZE ] = { 0 };
 
 static QueueHandle_t xRxQueue;          /* bytes: UART interrupt -> console task */
 static SemaphoreHandle_t xUartMutex;    /* guards the UART transmitter */
-static TaskHandle_t xBlinkTask, xConsoleTask, xButtonTask, xButton2Task, xLcdTask;
+static TaskHandle_t xBlinkTask, xConsoleTask, xButtonTask, xLcdTask;
 
 static volatile uint16_t usRxDropped;   /* bytes lost because the queue was full */
 
@@ -320,53 +321,88 @@ static void update_lcd_task( void *pvParameters )
     }
 }
 
+/* --- Buttons ----------------------------------------------------------- */
+
+/* Port 1 interrupt: runs when S1 or S2 goes from released to pressed.
+ *
+ * The RTOS cannot see a pin change by itself; the hardware interrupt detects
+ * it, and the RTOS provides the safe way to wake a task from the interrupt
+ * (here a task notification carrying which buttons were pressed). */
+#pragma vector = PORT1_VECTOR
+__interrupt void port1_isr( void )
+{
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    uint8_t ucPressed = ( uint8_t ) ( P1IFG & P1IE & BUTTON_BITS );
+
+    /* A mechanical button bounces: one press makes several edges within a
+     * few milliseconds. Turn the button interrupts off after the first edge;
+     * the button task turns them back on once the button has settled. */
+    P1IE &= ~BUTTON_BITS;
+    P1IFG &= ~BUTTON_BITS;
+
+    if( ucPressed != 0 )
+    {
+        xTaskNotifyFromISR( xButtonTask, ucPressed, eSetBits, &xHigherPriorityTaskWoken );
+    }
+
+    __bic_SR_register_on_exit( SCG1 + SCG0 + OSCOFF + CPUOFF );
+    portYIELD_FROM_ISR( xHigherPriorityTaskWoken );
+}
+
+/* Sleeps until the interrupt reports a press, so it uses no CPU while the
+ * buttons are idle. S1 counts up, S2 counts down. */
 static void button_task( void *pvParameters )
 {
-    TickType_t xLastWake = xTaskGetTickCount();
-
-    uint8_t ucPressed, ucWasPressed = 0;
+    uint32_t ulPressed;
+    uint8_t ucReleasedSamples;
 
     ( void ) pvParameters;
 
+    /* Start listening for presses. */
+    taskENTER_CRITICAL();
+    P1IFG &= ~BUTTON_BITS;
+    P1IE |= BUTTON_BITS;
+    taskEXIT_CRITICAL();
+
     for( ;; )
     {
-        /* The pin reads 0 while the button is held down. Count only the
-         * change from released to pressed; sampling every 50 ms also skips
-         * over contact bounce. */
-        ucPressed = ( uint8_t ) ( ( P1IN & BUTTON_S1_BIT ) == 0 );
-        if( ( ucPressed != 0 ) && ( ucWasPressed == 0 ) )
+        /* Block here until port1_isr() sends the pressed-button bits. */
+        xTaskNotifyWait( 0, 0xFFFFFFFFUL, &ulPressed, portMAX_DELAY );
+
+        if( ( ulPressed & BUTTON_S1_BIT ) != 0 )
         {
             usButtonPressCount++;
         }
-        ucWasPressed = ucPressed;
-
-        vTaskDelayUntil( &xLastWake, pdMS_TO_TICKS( 50 ) );
-    }
-}
-
-static void button2_task( void *pvParameters )
-{
-    TickType_t xLastWake = xTaskGetTickCount();
-
-    uint8_t ucPressed, ucWasPressed = 0;
-
-    ( void ) pvParameters;
-
-    for( ;; )
-    {
-        /* The pin reads 0 while the button is held down. Count only the
-         * change from released to pressed; sampling every 50 ms also skips
-         * over contact bounce. */
-        ucPressed = ( uint8_t ) ( ( P1IN & BUTTON_S2_BIT ) == 0 );
-        if( ( ucPressed != 0 ) && ( ucWasPressed == 0 ) )
+        if( ( ulPressed & BUTTON_S2_BIT ) != 0 )
         {
             usButtonPressCount--;
         }
-        ucWasPressed = ucPressed;
 
-        vTaskDelayUntil( &xLastWake, pdMS_TO_TICKS( 50 ) );
+        /* Debounce: wait until both buttons have read as released for two
+         * samples in a row (releasing bounces too), then listen again. */
+        ucReleasedSamples = 0;
+        while( ucReleasedSamples < 2 )
+        {
+            vTaskDelay( pdMS_TO_TICKS( 10 ) );
+            if( ( P1IN & BUTTON_BITS ) == BUTTON_BITS )
+            {
+                ucReleasedSamples++;
+            }
+            else
+            {
+                ucReleasedSamples = 0;
+            }
+        }
+
+        /* P1IE is also written by the interrupt, so change it with
+         * interrupts off. */
+        taskENTER_CRITICAL();
+        P1IFG &= ~BUTTON_BITS;
+        P1IE |= BUTTON_BITS;
+        taskEXIT_CRITICAL();
     }
 }
+
 /* --- Hardware setup ----------------------------------------------------- */
 
 static void hardware_init( void )
@@ -387,6 +423,7 @@ static void hardware_init( void )
     P1DIR &= ~BUTTON_S2_BIT;
     P1REN |= BUTTON_S2_BIT;
     P1OUT |= BUTTON_S2_BIT;
+    P1IES |= BUTTON_BITS;       /* interrupt on the 1 -> 0 edge, i.e. a press */
 
     /* UART pins to eUSCI_A1. */
     P3SEL0 |= UART_TX_BIT | UART_RX_BIT;
@@ -474,7 +511,6 @@ int main( void )
     xTaskCreate( console_task, "console", 160, NULL, 2, &xConsoleTask );
     xTaskCreate( update_lcd_task, "lcd", configMINIMAL_STACK_SIZE, NULL, 3, &xLcdTask );
     xTaskCreate( button_task, "button", configMINIMAL_STACK_SIZE, NULL, 4, &xButtonTask );
-    xTaskCreate( button2_task, "button2", configMINIMAL_STACK_SIZE, NULL, 5, &xButton2Task );
 
     vTaskStartScheduler();
 
