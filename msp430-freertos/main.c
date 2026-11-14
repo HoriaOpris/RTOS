@@ -3,12 +3,13 @@
  *
  * Data flow:
  *
- *   Mac --USB--> UART RX interrupt --queue--> command task --mutex--> UART TX
+ *   Mac --USB--> UART RX interrupt --queue--> console task --mutex--> UART TX
  *                                                  |
- *   blink task (red LED, 1 Hz)                     +--> green LED
+ *   blink task (red LED, 1 Hz) --shared counters---+--> green LED
  *
  * Serial port: 115200 baud, 8N1, on the LaunchPad's "application UART".
- * Commands (end each with Enter): on, off, stats. Anything else is echoed.
+ * The console task draws a status screen that refreshes twice a second and
+ * accepts the commands on, off and stats (type, then Enter).
  */
 #include <msp430.h>
 #include <stdint.h>
@@ -27,17 +28,35 @@
 
 #define RX_QUEUE_LENGTH 32
 #define LINE_MAX        40
+#define RESULT_MAX      70
+#define REFRESH_MS      500
+
+/* Terminal control sequences (understood by screen and most terminals). */
+#define TERM_HOME       "\x1b[H"        /* cursor to top left */
+#define TERM_EOL        "\x1b[K\r\n"    /* clear rest of line, next line */
+#define TERM_CLEAR_DOWN "\x1b[J"        /* clear from cursor to end of screen */
+#define TERM_PROMPT_ROW "\x1b[14;1H"    /* cursor to the input line */
 
 /* The FreeRTOS heap. PERSISTENT places it in FRAM rather than the 2 KB RAM. */
 #pragma PERSISTENT( ucHeap )
 uint8_t ucHeap[ configTOTAL_HEAP_SIZE ] = { 0 };
 
-static QueueHandle_t xRxQueue;          /* bytes: UART interrupt -> command task */
+static QueueHandle_t xRxQueue;          /* bytes: UART interrupt -> console task */
 static SemaphoreHandle_t xUartMutex;    /* guards the UART transmitter */
+static TaskHandle_t xBlinkTask, xConsoleTask;
 
 static volatile uint16_t usRxDropped;   /* bytes lost because the queue was full */
 
-/* --- UART --------------------------------------------------------------- */
+/* Written by the blink task, read by the console task.
+ *
+ * usFlashCount is 16 bits, which this 16-bit CPU reads in one instruction, so
+ * it needs no protection. ulHalfSeconds is 32 bits: reading it takes two
+ * instructions, and a task switch between them could return a torn value, so
+ * every access is wrapped in a critical section. */
+static volatile uint16_t usFlashCount;
+static volatile uint32_t ulHalfSeconds;
+
+/* --- UART output -------------------------------------------------------- */
 
 /* Send a string. The mutex stops two tasks interleaving their output. */
 static void uart_puts( const char *s )
@@ -51,22 +70,32 @@ static void uart_puts( const char *s )
     xSemaphoreGive( xUartMutex );
 }
 
-static void uart_put_uint( const char *label, uint16_t value )
+/* Convert a number to decimal text, at least minDigits wide (zero padded).
+ * Returns a pointer into buf, which must hold at least 11 characters. */
+static char *uint_to_text( uint32_t value, uint16_t minDigits, char *buf )
 {
-    char buf[ 6 ];
-    char *p = &buf[ 5 ];
+    char *p = &buf[ 10 ];
+    uint16_t digits = 0;
 
     *p = '\0';
     do
     {
         *--p = ( char ) ( '0' + ( value % 10 ) );
         value /= 10;
-    } while( value != 0 );
+        digits++;
+    } while( ( value != 0 ) || ( digits < minDigits ) );
 
-    uart_puts( label );
-    uart_puts( p );
-    uart_puts( "\r\n" );
+    return p;
 }
+
+static void uart_put_uint( uint32_t value, uint16_t minDigits )
+{
+    char buf[ 11 ];
+
+    uart_puts( uint_to_text( value, minDigits, buf ) );
+}
+
+/* --- UART input --------------------------------------------------------- */
 
 /* Receive interrupt: keep it short, hand the byte to a task, never block. */
 #pragma vector = USCI_A1_VECTOR
@@ -85,15 +114,13 @@ __interrupt void uart_rx_isr( void )
         }
     }
 
-    /* Wake the CPU if it was sleeping, and switch straight to the command
+    /* Wake the CPU if it was sleeping, and switch straight to the console
      * task if the byte unblocked it. */
     __bic_SR_register_on_exit( SCG1 + SCG0 + OSCOFF + CPUOFF );
     portYIELD_FROM_ISR( xHigherPriorityTaskWoken );
 }
 
-/* --- Tasks -------------------------------------------------------------- */
-
-static TaskHandle_t xBlinkTask, xCommandTask;
+/* --- Blink task --------------------------------------------------------- */
 
 static void blink_task( void *pvParameters )
 {
@@ -104,17 +131,41 @@ static void blink_task( void *pvParameters )
     for( ;; )
     {
         P1OUT ^= LED_RED_BIT;
+        if( ( P1OUT & LED_RED_BIT ) != 0 )
+        {
+            usFlashCount++;
+        }
+
         vTaskDelayUntil( &xLastWake, pdMS_TO_TICKS( 500 ) );
+
+        taskENTER_CRITICAL();
+        ulHalfSeconds++;
+        taskEXIT_CRITICAL();
     }
 }
 
-static void print_stats( void )
+/* --- Console task ------------------------------------------------------- */
+
+static char cLine[ LINE_MAX + 1 ];      /* command being typed */
+static uint16_t usLineLen;
+static char cResult[ RESULT_MAX + 1 ] = "-";    /* outcome of the last command */
+
+static void result_set( const char *s )
 {
-    uart_put_uint( "uptime ticks (wraps at 65536): ", xTaskGetTickCount() );
-    uart_put_uint( "heap free bytes: ", ( uint16_t ) xPortGetFreeHeapSize() );
-    uart_put_uint( "blink stack free words: ", uxTaskGetStackHighWaterMark( xBlinkTask ) );
-    uart_put_uint( "command stack free words: ", uxTaskGetStackHighWaterMark( xCommandTask ) );
-    uart_put_uint( "rx bytes dropped: ", usRxDropped );
+    strncpy( cResult, s, RESULT_MAX );
+    cResult[ RESULT_MAX ] = '\0';
+}
+
+static void result_append( const char *s )
+{
+    strncat( cResult, s, RESULT_MAX - strlen( cResult ) );
+}
+
+static void result_append_uint( uint32_t value )
+{
+    char buf[ 11 ];
+
+    result_append( uint_to_text( value, 1, buf ) );
 }
 
 static void handle_line( const char *line )
@@ -122,52 +173,121 @@ static void handle_line( const char *line )
     if( strcmp( line, "on" ) == 0 )
     {
         P9OUT |= LED_GREEN_BIT;
-        uart_puts( "green LED on\r\n" );
+        result_set( "green LED turned on" );
     }
     else if( strcmp( line, "off" ) == 0 )
     {
         P9OUT &= ~LED_GREEN_BIT;
-        uart_puts( "green LED off\r\n" );
+        result_set( "green LED turned off" );
     }
     else if( strcmp( line, "stats" ) == 0 )
     {
-        print_stats();
+        result_set( "heap free " );
+        result_append_uint( xPortGetFreeHeapSize() );
+        result_append( " B, stack free blink " );
+        result_append_uint( uxTaskGetStackHighWaterMark( xBlinkTask ) );
+        result_append( " console " );
+        result_append_uint( uxTaskGetStackHighWaterMark( xConsoleTask ) );
+        result_append( " words, rx lost " );
+        result_append_uint( usRxDropped );
     }
     else
     {
-        uart_puts( "echo: " );
-        uart_puts( line );
-        uart_puts( "\r\n" );
+        result_set( "echo: " );
+        result_append( line );
     }
 }
 
-/* Blocks on the queue, so it uses no CPU until a byte arrives. */
-static void command_task( void *pvParameters )
+/* Redraw only the input line; used after each keystroke. */
+static void draw_prompt( void )
 {
-    static char line[ LINE_MAX + 1 ];
-    uint16_t len = 0;
+    uart_puts( TERM_PROMPT_ROW "> " );
+    uart_puts( cLine );
+    uart_puts( "\x1b[K" );
+}
+
+/* Redraw the whole screen in place. Each line clears its own tail, so the
+ * screen never blanks and does not flicker. */
+static void draw_screen( void )
+{
+    uint32_t ulSeconds;
+
+    taskENTER_CRITICAL();
+    ulSeconds = ulHalfSeconds / 2;
+    taskEXIT_CRITICAL();
+
+    uart_puts( TERM_HOME "FreeRTOS on MSP430FR6989 LaunchPad" TERM_EOL TERM_EOL );
+
+    uart_puts( "Red LED flashes : " );
+    uart_put_uint( usFlashCount, 1 );
+    uart_puts( TERM_EOL );
+
+    uart_puts( "Up time         : " );
+    uart_put_uint( ulSeconds / 3600, 1 );
+    uart_puts( ":" );
+    uart_put_uint( ( ulSeconds / 60 ) % 60, 2 );
+    uart_puts( ":" );
+    uart_put_uint( ulSeconds % 60, 2 );
+    uart_puts( TERM_EOL );
+
+    uart_puts( "Green LED       : " );
+    uart_puts( ( ( P9OUT & LED_GREEN_BIT ) != 0 ) ? "on" : "off" );
+    uart_puts( TERM_EOL );
+
+    uart_puts( "Last result     : " );
+    uart_puts( cResult );
+    uart_puts( TERM_EOL TERM_EOL );
+
+    uart_puts( "Type a command, then press Enter:" TERM_EOL
+               "  on     turn the green LED on" TERM_EOL
+               "  off    turn the green LED off" TERM_EOL
+               "  stats  show heap and stack usage" TERM_EOL
+               "  (anything else is echoed back)" TERM_EOL
+               TERM_EOL );
+
+    /* The input line is last, so the cursor is left where the user types. */
+    uart_puts( "> " );
+    uart_puts( cLine );
+    uart_puts( TERM_CLEAR_DOWN );
+}
+
+/* Blocks on the queue with a timeout: a key press wakes it at once, and the
+ * timeout gives the periodic refresh. It uses no CPU in between. */
+static void console_task( void *pvParameters )
+{
     uint8_t c;
 
     ( void ) pvParameters;
 
-    uart_puts( "\r\nFreeRTOS on MSP430FR6989 ready. Commands: on, off, stats\r\n" );
-
     for( ;; )
     {
-        xQueueReceive( xRxQueue, &c, portMAX_DELAY );
-
-        if( ( c == '\r' ) || ( c == '\n' ) )
+        if( xQueueReceive( xRxQueue, &c, pdMS_TO_TICKS( REFRESH_MS ) ) != pdPASS )
         {
-            if( len > 0 )
-            {
-                line[ len ] = '\0';
-                handle_line( line );
-                len = 0;
-            }
+            draw_screen();              /* timed out: periodic refresh */
         }
-        else if( len < LINE_MAX )
+        else if( ( c == '\r' ) || ( c == '\n' ) )
         {
-            line[ len++ ] = ( char ) c;
+            if( usLineLen > 0 )
+            {
+                handle_line( cLine );
+                usLineLen = 0;
+                cLine[ 0 ] = '\0';
+            }
+            draw_screen();
+        }
+        else if( ( c == 0x08 ) || ( c == 0x7f ) )   /* backspace or delete */
+        {
+            if( usLineLen > 0 )
+            {
+                cLine[ --usLineLen ] = '\0';
+            }
+            draw_prompt();
+        }
+        else if( ( c >= ' ' ) && ( c < 0x7f ) && ( usLineLen < LINE_MAX ) )
+        {
+            cLine[ usLineLen++ ] = ( char ) c;
+            cLine[ usLineLen ] = '\0';
+            draw_prompt();
         }
     }
 }
@@ -264,9 +384,9 @@ int main( void )
     configASSERT( xRxQueue != NULL );
     configASSERT( xUartMutex != NULL );
 
-    /* The command task has the higher priority so input is handled promptly. */
+    /* The console task has the higher priority so input is handled promptly. */
     xTaskCreate( blink_task, "blink", configMINIMAL_STACK_SIZE, NULL, 1, &xBlinkTask );
-    xTaskCreate( command_task, "command", 160, NULL, 2, &xCommandTask );
+    xTaskCreate( console_task, "console", 160, NULL, 2, &xConsoleTask );
 
     vTaskStartScheduler();
 
